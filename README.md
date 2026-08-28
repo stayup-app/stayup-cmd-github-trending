@@ -56,7 +56,28 @@ log
   repository_id → repository.id
   error         TEXT
   executed_at   TIMESTAMPTZ
+
+provider_registry               -- shared; this collector upserts exactly its own row
+  name          TEXT PK          -- 'github_trending'
+  display_name  TEXT             -- 'GitHub Trending'
+  sort_order    INTEGER
+  template      JSONB            -- display manifest (see below)
 ```
+
+### Display template
+
+On every run this collector upserts a **display template** into `provider_registry.template`
+(`DISPLAY_TEMPLATE` in `fetch_trending.py`). `stayup-api` relays it verbatim on
+`GET /connectors/providers`, and the 3 client apps (`stayup-ui`, `stayup-desktop`,
+`stayup-mobile`) render this connector's feed straight from it — **no per-connector code
+in any app**. One `connector_github_trending` row is one trending window, so the feed
+entry summarises the window (`GitHub Trending — today · N repositories`) and the reading
+pane is a `mode: table` view over the embedded `repos` list, mirroring
+[github.com/trending](https://github.com/trending): rank · `owner/name` (linked) ·
+description · language · stars · forks · stars this period.
+
+The template shape is documented in
+[`stayup-api/docs/display-templates.md`](https://github.com/stayup-app/stayup-api/blob/main/docs/display-templates.md).
 
 ### `content` JSON format
 

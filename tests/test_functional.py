@@ -16,6 +16,7 @@ import psycopg2
 import pytest
 
 from fetch_trending import (
+    DISPLAY_TEMPLATE,
     ensure_sources,
     get_repositories,
     init_db,
@@ -57,6 +58,32 @@ def db_conn():
 
 def fake_repos(n=3):
     return [{"rank": i, "full_name": f"owner{i}/repo{i}", "stars": i * 100} for i in range(1, n + 1)]
+
+
+# ---------------------------------------------------------------------------
+# init_db — provider registration
+# ---------------------------------------------------------------------------
+
+
+class TestInitDb:
+    def test_registers_name_and_display_template(self, db_conn):
+        init_db(db_conn)
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT display_name, sort_order, template FROM provider_registry WHERE name = 'github_trending'"
+            )
+            display_name, sort_order, template = cur.fetchone()
+        assert display_name == "GitHub Trending"
+        assert sort_order == 50
+        # psycopg2 returns a JSONB column already decoded.
+        assert template == DISPLAY_TEMPLATE
+
+    def test_is_idempotent(self, db_conn):
+        init_db(db_conn)
+        init_db(db_conn)
+        with db_conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM provider_registry WHERE name = 'github_trending'")
+            assert cur.fetchone()[0] == 1
 
 
 # ---------------------------------------------------------------------------

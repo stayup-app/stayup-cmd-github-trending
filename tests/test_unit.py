@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import ANY, MagicMock, call, patch
@@ -9,6 +10,7 @@ from unittest.mock import ANY, MagicMock, call, patch
 import pytest
 
 from fetch_trending import (
+    DISPLAY_TEMPLATE,
     _parse_int,
     build_content,
     ensure_sources,
@@ -172,19 +174,76 @@ class TestBuildContent:
 
 
 class TestInitDb:
-    def test_executes_ddl_and_commits(self):
+    def test_runs_ddl_then_registers_provider_and_commits(self):
         conn, cursor = make_conn_mock()
         init_db(conn)
-        assert cursor.execute.call_count == 1
+        assert cursor.execute.call_count == 2
         conn.commit.assert_called_once()
 
-    def test_ddl_defines_table_and_registers_provider(self):
+    def test_ddl_defines_table_and_adds_template_column(self):
         conn, cursor = make_conn_mock()
         init_db(conn)
-        sql = cursor.execute.call_args[0][0]
-        assert "CREATE TABLE IF NOT EXISTS connector_github_trending" in sql
+        ddl = cursor.execute.call_args_list[0].args[0]
+        assert "CREATE TABLE IF NOT EXISTS connector_github_trending" in ddl
+        assert "ADD COLUMN IF NOT EXISTS template" in ddl
+
+    def test_registers_provider_with_display_template_as_param(self):
+        conn, cursor = make_conn_mock()
+        init_db(conn)
+        sql, params = cursor.execute.call_args_list[1].args
         assert "INSERT INTO provider_registry" in sql
-        assert "'github_trending', 'GitHub Trending'" in sql
+        assert "template" in sql
+        name, display, sort_order, template_json = params
+        assert (name, display, sort_order) == ("github_trending", "GitHub Trending", 50)
+        template = json.loads(template_json)
+        assert template["version"] == 1
+        assert template["detail"]["mode"] == "table"
+        assert template["detail"]["collection"] == "repos"
+
+
+class TestDisplayTemplate:
+    def test_round_trips_through_json_unchanged(self):
+        assert json.loads(json.dumps(DISPLAY_TEMPLATE)) == DISPLAY_TEMPLATE
+
+    def test_ships_a_self_describing_icon(self):
+        # Le connecteur fournit son icône (tracé SVG teintable), pas une clé du
+        # jeu intégré des apps : un nouveau connecteur s'affiche sans toucher au code.
+        icon = DISPLAY_TEMPLATE["display"]["icon"]
+        assert isinstance(icon, dict)
+        assert icon["paths"]
+        assert all(p[:1] in ("M", "m") for p in icon["paths"])
+        assert icon["viewBox"] == "0 0 24 24"
+
+    def test_declares_a_table_detail_over_the_repos_list(self):
+        assert DISPLAY_TEMPLATE["version"] == 1
+        assert DISPLAY_TEMPLATE["display"]["name"] == "GitHub Trending"
+        assert DISPLAY_TEMPLATE["item"]["parseContentAsJson"] is True
+        detail = DISPLAY_TEMPLATE["detail"]
+        assert detail["mode"] == "table"
+        assert detail["collection"] == "repos"
+        labels = [c["label"] for c in detail["columns"]]
+        assert labels == ["#", "Repository", "Description", "Language", "Stars", "Forks", "This period"]
+        assert all("field" in c for c in detail["columns"])
+
+    def test_every_interpolation_token_is_produced_by_the_connector(self):
+        # Tokens used in {template} strings must resolve against the stored content
+        # (see build_content) or the `map` aliases — never a field the app can't fill.
+        produced = {"since", "url", "count", "fetched_at", "repos", "window"}
+        content_keys = {
+            "rank",
+            "owner",
+            "name",
+            "full_name",
+            "url",
+            "description",
+            "language",
+            "stars",
+            "forks",
+            "stars_period",
+        }
+        blob = json.dumps(DISPLAY_TEMPLATE)
+        tokens = set(re.findall(r"\{(\w+)\}", blob))
+        assert tokens <= produced | content_keys
 
 
 class TestEnsureSources:

@@ -51,22 +51,117 @@ CREATE TABLE IF NOT EXISTS log (
     executed_at TIMESTAMPTZ NOT NULL
 );
 
--- Registre partagé des providers : chaque collecteur y déclare son nom affiché au
--- démarrage. L'API stayup-api lit cette table pour construire une UI dynamique ;
--- elle ne connaît aucun nom de provider en dur, seulement les tables connector_*.
+-- Registre partagé des providers : chaque collecteur y déclare son nom affiché et
+-- son template d'affichage au démarrage. L'API stayup-api lit cette table pour
+-- construire une UI dynamique ; elle ne connaît aucun nom de provider en dur,
+-- seulement les tables connector_*. Le registre est renseigné juste après ce DDL
+-- (voir REGISTER_PROVIDER_SQL) — pas ici, pour passer le template en paramètre.
 CREATE TABLE IF NOT EXISTS provider_registry (
     name          TEXT PRIMARY KEY,
     display_name  TEXT NOT NULL,
     sort_order    INTEGER NOT NULL DEFAULT 100,
+    template      JSONB,
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-INSERT INTO provider_registry (name, display_name, sort_order)
-VALUES ('github_trending', 'GitHub Trending', 50)
-ON CONFLICT (name) DO UPDATE SET display_name = EXCLUDED.display_name, updated_at = NOW();
+-- Registre antérieur à la colonne `template` : on l'ajoute sans rien réécrire.
+ALTER TABLE provider_registry ADD COLUMN IF NOT EXISTS template JSONB;
 """
 
 PROVIDER_TYPE = "github_trending"
+
+# Nom affiché du provider dans les apps (fallback : nom de table capitalisé).
+DISPLAY_NAME = "GitHub Trending"
+
+# Manifeste d'affichage : comment les 3 apps (ui / desktop / mobile) rendent les
+# lignes de ce connecteur, sans une ligne de code côté app. stayup-api le relaie
+# tel quel depuis provider_registry.template, sans jamais l'interpréter.
+# Schéma : voir stayup-api/docs/self-hosting-and-providers.md.
+#
+# Une ligne connector_github_trending = une fenêtre (daily/weekly/monthly) dont le
+# `content` JSON porte la liste `repos`. L'entrée de liste résume la fenêtre ; le
+# volet de lecture est le tableau de ses dépôts (comme github.com/trending).
+DISPLAY_TEMPLATE = {
+    "version": 1,
+    "display": {
+        "name": DISPLAY_NAME,
+        # Icône auto-descriptive (tracé SVG teintable). Flèche « tendance ».
+        "icon": {
+            "paths": [
+                "M22 7 13.5 15.5 8.5 10.5 2 17",
+                "M16 7h6v6",
+            ],
+            "viewBox": "0 0 24 24",
+            "stroke": True,
+        },
+        "accent": "#f4b585",
+        "sortOrder": 50,
+        "feedLabel": {"path": "$source.config.since"},
+    },
+    "item": {
+        "parseContentAsJson": True,
+        "vars": {
+            "window": {
+                "path": "since",
+                "cases": {"daily": "today", "weekly": "this week", "monthly": "this month"},
+            }
+        },
+        "fields": {
+            "title": "GitHub Trending — {window}",
+            "subtitle": "{count} repositories",
+            "summary": "The {count} repositories trending {window} on GitHub.",
+            "url": "url",
+            "timestamp": "fetched_at",
+        },
+    },
+    "list": {
+        "layout": "row",
+        "primary": "title",
+        "secondary": "subtitle",
+        "meta": "timestamp",
+    },
+    "detail": {
+        "mode": "table",
+        "title": "Trending {window}",
+        "collection": "repos",
+        "rowLink": "url",
+        "columns": [
+            {"label": "#", "field": "rank", "align": "right", "width": "2.5rem"},
+            {
+                "label": "Repository",
+                "field": "{owner}/{name}",
+                "link": "url",
+                "emphasis": True,
+            },
+            {"label": "Description", "field": "description", "muted": True, "truncate": True},
+            {"label": "Language", "field": "language"},
+            {"label": "Stars", "field": "stars", "align": "right", "format": "compactNumber"},
+            {"label": "Forks", "field": "forks", "align": "right", "format": "compactNumber"},
+            {
+                "label": "This period",
+                "field": "stars_period",
+                "align": "right",
+                "format": "compactNumber",
+                "prefix": "+",
+                "accent": True,
+            },
+        ],
+        "openUrl": "url",
+        "openLabel": "Open on github.com/trending",
+    },
+}
+
+# Upsert du registre, template passé en paramètre (le JSON contient des guillemets
+# et échapperait mal dans un DDL littéral). `sort_order` n'est pas réécrit sur
+# conflit, par cohérence avec les autres collecteurs stayup-cmd-*.
+REGISTER_PROVIDER_SQL = """
+INSERT INTO provider_registry (name, display_name, sort_order, template)
+VALUES (%s, %s, %s, %s::jsonb)
+ON CONFLICT (name) DO UPDATE SET
+    display_name = EXCLUDED.display_name,
+    template     = EXCLUDED.template,
+    updated_at   = NOW();
+"""
 
 # The three tracked trending windows. Seeded automatically on every run.
 SOURCES = [
@@ -102,9 +197,13 @@ def get_db_conn() -> psycopg2.extensions.connection:
 
 
 def init_db(conn: psycopg2.extensions.connection) -> None:
-    """Create tables if they don't exist and register the provider."""
+    """Create tables if they don't exist and register the provider (name + display template)."""
     with conn.cursor() as cur:
         cur.execute(DDL)
+        cur.execute(
+            REGISTER_PROVIDER_SQL,
+            (PROVIDER_TYPE, DISPLAY_NAME, 50, json.dumps(DISPLAY_TEMPLATE)),
+        )
     conn.commit()
 
 
