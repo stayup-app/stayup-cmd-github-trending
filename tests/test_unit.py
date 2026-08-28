@@ -1,9 +1,10 @@
 """Unit tests — no external dependencies (DB, network)."""
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 
@@ -12,8 +13,10 @@ from fetch_trending import (
     build_content,
     ensure_sources,
     fetch_trending,
+    get_db_conn,
     get_repositories,
     init_db,
+    main,
     process_repository,
     replace_entry,
     save_error,
@@ -107,6 +110,21 @@ class TestFetchTrending:
 
         assert repo["language"] == "Python"
         assert repo["stars_period"] == 512
+
+    @patch("fetch_trending.requests.get")
+    def test_skips_rows_without_a_repository_link(self, mock_get):
+        mock_get.return_value.text = (
+            "<html><body>"
+            '<article class="Box-row"><div>promo, no link</div></article>'
+            '<article class="Box-row"><h2><a href="/octocat/hello">octocat / hello</a></h2></article>'
+            "</body></html>"
+        )
+        mock_get.return_value.raise_for_status = MagicMock()
+
+        repos = fetch_trending("https://github.com/trending")
+
+        assert [r["full_name"] for r in repos] == ["octocat/hello"]
+        assert repos[0]["rank"] == 2  # enumerate keeps the row's position
 
     @patch("fetch_trending.requests.get")
     def test_raises_when_no_rows(self, mock_get):
@@ -277,3 +295,74 @@ class TestProcessRepository:
         sql = cursor.execute.call_args[0][0]
         assert "INSERT INTO log" in sql
         assert "rate limited" in cursor.execute.call_args[0][1][1]
+
+    @patch("fetch_trending.fetch_trending")
+    def test_defaults_to_daily_when_since_missing(self, mock_fetch):
+        mock_fetch.return_value = [{"rank": 1, "full_name": "a/b"}]
+        conn, cursor = make_conn_mock()
+        executed_at = datetime(2026, 8, 28, tzinfo=timezone.utc)
+
+        process_repository(conn, 1, "https://github.com/trending", executed_at, {})
+
+        assert cursor.execute.call_args_list[-1].args[1][1] == "daily@2026-08-28"
+
+
+# ---------------------------------------------------------------------------
+# get_db_conn
+# ---------------------------------------------------------------------------
+
+
+class TestGetDbConn:
+    @patch("fetch_trending.psycopg2.connect")
+    def test_uses_database_url_when_set(self, mock_connect):
+        with patch.dict(os.environ, {"DATABASE_URL": "postgresql://u:p@h:5432/db"}, clear=True):
+            get_db_conn()
+        mock_connect.assert_called_once_with("postgresql://u:p@h:5432/db")
+
+    @patch("fetch_trending.psycopg2.connect")
+    def test_falls_back_to_individual_db_vars(self, mock_connect):
+        env = {"DB_HOST": "pg", "DB_PORT": "6543", "DB_NAME": "d", "DB_USER": "u", "DB_PASSWORD": "s"}
+        with patch.dict(os.environ, env, clear=True):
+            get_db_conn()
+        mock_connect.assert_called_once_with(host="pg", port=6543, dbname="d", user="u", password="s")
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+
+class TestMain:
+    @patch("fetch_trending.process_repository")
+    @patch("fetch_trending.get_repositories")
+    @patch("fetch_trending.ensure_sources")
+    @patch("fetch_trending.init_db")
+    @patch("fetch_trending.get_db_conn")
+    def test_processes_every_source_then_closes(self, mock_conn, mock_init, mock_seed, mock_get, mock_process):
+        conn = MagicMock()
+        mock_conn.return_value = conn
+        mock_get.return_value = [
+            (1, "https://github.com/trending?since=daily", {"since": "daily"}),
+            (2, "https://github.com/trending?since=weekly", {"since": "weekly"}),
+        ]
+
+        main()
+
+        mock_init.assert_called_once_with(conn)
+        mock_seed.assert_called_once_with(conn)
+        assert mock_process.call_count == 2
+        assert mock_process.call_args_list[0] == call(
+            conn, 1, "https://github.com/trending?since=daily", ANY, {"since": "daily"}
+        )
+        conn.close.assert_called_once()
+
+    @patch("fetch_trending.init_db", side_effect=RuntimeError("db down"))
+    @patch("fetch_trending.get_db_conn")
+    def test_closes_connection_even_on_error(self, mock_conn, _mock_init):
+        conn = MagicMock()
+        mock_conn.return_value = conn
+
+        with pytest.raises(RuntimeError, match="db down"):
+            main()
+
+        conn.close.assert_called_once()

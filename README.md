@@ -121,7 +121,9 @@ gh secret set DATABASE_URL -R stayup-app/stayup-cmd-github-trending
 ```
 
 `.github/workflows/ci.yml` runs on every push and pull request to `main`: **ruff** + **black**
-lint, then unit and functional tests against a temporary PostgreSQL service.
+lint, then the unit and functional test suite against a temporary PostgreSQL service. The build
+fails if line coverage of `fetch_trending.py` drops below **100%** (`--cov-fail-under=100`, set in
+`pyproject.toml`); the unit tests alone reach 100%, the functional tests add real-database checks.
 
 ## Development
 
@@ -132,4 +134,13 @@ cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
 # Lint + tests via Docker
 docker compose run --rm --entrypoint="" test sh -c "ruff check . && black --check ."
 docker compose run --rm test
+```
+
+Run the suite directly (needs a PostgreSQL for the functional tests; the unit tests need neither
+a database nor network and already give 100% coverage):
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests/ -v                 # coverage report + 100% gate come from pyproject.toml
+pytest tests/test_unit.py -v     # unit only, no PostgreSQL required
 ```
