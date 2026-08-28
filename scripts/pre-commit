@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Pre-commit hook — runs linter and tests inside Docker.
+# Install with: cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+
+set -e
+
+echo "[ pre-commit ] Building Docker image..."
+docker compose build --quiet
+
+echo "[ pre-commit ] Running linter (ruff + black)..."
+docker run --rm --entrypoint="" -v "$(pwd)":/app -w /app stayup-test sh -c "ruff check . && black --check ."
+
+echo "[ pre-commit ] Running tests..."
+docker compose run --rm test
+
+echo "[ pre-commit ] All checks passed."
