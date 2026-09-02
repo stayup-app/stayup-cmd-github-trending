@@ -30,6 +30,11 @@ So `connector_github_trending` always holds **exactly three rows** — one per w
 on every execution. If a window fails to fetch, its previous snapshot is kept and the error is
 written to the `log` table; the run never crashes.
 
+The window a source tracks is read from its `repository.url` (`?since=…`); `config.since` is only a
+fallback. So a source added through the app — where the display template's `form` block (see below)
+asks for a single word, **`daily` / `weekly` / `monthly`**, instead of the full URL — works even
+though the app stores no `config`.
+
 > Unlike the other `stayup-cmd-*` collectors, this one keeps no history and ignores
 > `config.retention_days`: a trending list is a full snapshot that is entirely replaced each day.
 
@@ -75,6 +80,11 @@ entry summarises the window (`GitHub Trending — today · N repositories`) and 
 pane is a `mode: table` view over the embedded `repos` list, mirroring
 [github.com/trending](https://github.com/trending): rank · `owner/name` (linked) ·
 description · language · stars · forks · stars this period.
+
+The template also carries a `form` block, so the app's "add a flux" dialog shows a **single field**
+for this provider: type `daily`, `weekly` or `monthly` (or paste a full `…/trending?since=…` URL) and
+the app builds the `repository.url` itself. The feed's sidebar label (`feedLabel`) is derived from
+that URL, so it reads `daily` / `weekly` / `monthly` whether the source was seeded or added in-app.
 
 The template shape is documented in
 [`stayup-api/docs/display-templates.md`](https://github.com/stayup-app/stayup-api/blob/main/docs/display-templates.md).

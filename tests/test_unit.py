@@ -11,6 +11,7 @@ import pytest
 
 from fetch_trending import (
     DISPLAY_TEMPLATE,
+    SOURCES,
     _parse_int,
     build_content,
     ensure_sources,
@@ -22,6 +23,7 @@ from fetch_trending import (
     process_repository,
     replace_entry,
     save_error,
+    window_from_url,
 )
 
 FIXTURE_HTML = (Path(__file__).parent / "fixtures" / "trending.html").read_text(encoding="utf-8")
@@ -169,6 +171,25 @@ class TestBuildContent:
 
 
 # ---------------------------------------------------------------------------
+# window_from_url
+# ---------------------------------------------------------------------------
+
+
+class TestWindowFromUrl:
+    def test_extracts_each_window(self):
+        assert window_from_url("https://github.com/trending?since=daily") == "daily"
+        assert window_from_url("https://github.com/trending?since=weekly") == "weekly"
+        assert window_from_url("https://github.com/trending?since=monthly") == "monthly"
+
+    def test_reads_since_among_other_query_params(self):
+        assert window_from_url("https://github.com/trending?spoken_language_code=en&since=weekly") == "weekly"
+
+    def test_none_when_absent_or_unknown(self):
+        assert window_from_url("https://github.com/trending") is None
+        assert window_from_url("https://github.com/trending?since=yearly") is None
+
+
+# ---------------------------------------------------------------------------
 # DB helpers (mocked connection)
 # ---------------------------------------------------------------------------
 
@@ -227,7 +248,8 @@ class TestDisplayTemplate:
 
     def test_every_interpolation_token_is_produced_by_the_connector(self):
         # Tokens used in {template} strings must resolve against the stored content
-        # (see build_content) or the `map` aliases — never a field the app can't fill.
+        # (see build_content) or the `vars` aliases — never a field the app can't fill.
+        # `form` is excluded: its {value} is the user's form input, filled by stayup-ui.
         produced = {"since", "url", "count", "fetched_at", "repos", "window"}
         content_keys = {
             "rank",
@@ -241,9 +263,29 @@ class TestDisplayTemplate:
             "forks",
             "stars_period",
         }
-        blob = json.dumps(DISPLAY_TEMPLATE)
+        blob = json.dumps({k: v for k, v in DISPLAY_TEMPLATE.items() if k != "form"})
         tokens = set(re.findall(r"\{(\w+)\}", blob))
         assert tokens <= produced | content_keys
+
+    def test_feed_label_maps_each_window_url_to_its_word(self):
+        # Le libellé du flux se lit sur l'URL (pas config.since) pour rester juste
+        # même quand le flux a été ajouté via `form`, qui ne pose que l'URL.
+        cases = DISPLAY_TEMPLATE["display"]["feedLabel"]["cases"]
+        assert cases == {
+            "https://github.com/trending?since=daily": "daily",
+            "https://github.com/trending?since=weekly": "weekly",
+            "https://github.com/trending?since=monthly": "monthly",
+        }
+
+    def test_add_flux_form_takes_a_single_window_word(self):
+        form = DISPLAY_TEMPLATE["form"]
+        assert form["urlTemplate"] == "https://github.com/trending?since={value}"
+        assert re.match(form["pattern"], "weekly")
+        assert re.match(form["pattern"], "https://github.com/trending?since=weekly") is None
+        # chaque mot du formulaire reconstruit exactement l'URL d'une source seedée
+        seeded = {url for url, _ in SOURCES}
+        for word in ("daily", "weekly", "monthly"):
+            assert form["urlTemplate"].replace("{value}", word) in seeded
 
 
 class TestEnsureSources:
@@ -364,6 +406,27 @@ class TestProcessRepository:
         process_repository(conn, 1, "https://github.com/trending", executed_at, {})
 
         assert cursor.execute.call_args_list[-1].args[1][1] == "daily@2026-08-28"
+
+    @patch("fetch_trending.fetch_trending")
+    def test_derives_window_from_url_when_config_has_no_since(self, mock_fetch):
+        # Cas d'un flux ajouté via le formulaire `form` : config vide, fenêtre dans l'URL.
+        mock_fetch.return_value = [{"rank": 1, "full_name": "a/b"}]
+        conn, cursor = make_conn_mock()
+        executed_at = datetime(2026, 8, 28, tzinfo=timezone.utc)
+
+        process_repository(conn, 1, "https://github.com/trending?since=weekly", executed_at, {})
+
+        assert cursor.execute.call_args_list[-1].args[1][1] == "weekly@2026-08-28"
+
+    @patch("fetch_trending.fetch_trending")
+    def test_falls_back_to_config_since_when_url_has_no_window(self, mock_fetch):
+        mock_fetch.return_value = [{"rank": 1, "full_name": "a/b"}]
+        conn, cursor = make_conn_mock()
+        executed_at = datetime(2026, 8, 28, tzinfo=timezone.utc)
+
+        process_repository(conn, 1, "https://github.com/trending", executed_at, {"since": "monthly"})
+
+        assert cursor.execute.call_args_list[-1].args[1][1] == "monthly@2026-08-28"
 
 
 # ---------------------------------------------------------------------------

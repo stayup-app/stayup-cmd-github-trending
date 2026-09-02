@@ -96,7 +96,18 @@ DISPLAY_TEMPLATE = {
         },
         "accent": "#f4b585",
         "sortOrder": 50,
-        "feedLabel": {"path": "$source.config.since"},
+        # Libellé court du flux dans la sidebar : daily / weekly / monthly. Lu
+        # depuis l'URL (et non config.since) pour rester correct même quand le
+        # flux a été ajouté via le formulaire `form` ci-dessous, qui ne renseigne
+        # que `repository.url`.
+        "feedLabel": {
+            "path": "$source.url",
+            "cases": {
+                "https://github.com/trending?since=daily": "daily",
+                "https://github.com/trending?since=weekly": "weekly",
+                "https://github.com/trending?since=monthly": "monthly",
+            },
+        },
     },
     "item": {
         "parseContentAsJson": True,
@@ -149,6 +160,19 @@ DISPLAY_TEMPLATE = {
         "openUrl": "url",
         "openLabel": "Open on github.com/trending",
     },
+    # Champ « ajouter un flux » : une seule saisie (daily / weekly / monthly) au
+    # lieu de l'URL complète. stayup-ui construit lui-même `repository.url` à
+    # partir de `urlTemplate` — l'URL produite est identique à celle des 3 sources
+    # seedées (voir SOURCES), donc un ajout manuel se déduplique avec la source
+    # existante au lieu d'en créer une quatrième.
+    "form": {
+        "label": "Trending window (daily, weekly or monthly)",
+        "placeholder": "daily",
+        "urlTemplate": "https://github.com/trending?since={value}",
+        "pattern": "^(daily|weekly|monthly)$",
+        # Tolère le collage d'une URL complète : on en extrait la fenêtre.
+        "transform": {"trim": True, "extract": r"[?&]since=([a-z]+)"},
+    },
 }
 
 # Upsert du registre, template passé en paramètre (le JSON contient des guillemets
@@ -171,6 +195,14 @@ SOURCES = [
 ]
 
 PERIOD_STARS_RE = re.compile(r"([\d,]+)\s+stars?\s+(?:today|this week|this month)")
+
+WINDOW_RE = re.compile(r"[?&]since=(daily|weekly|monthly)\b")
+
+
+def window_from_url(url: str) -> str | None:
+    """Return the trending window (daily / weekly / monthly) encoded in a source URL, or None."""
+    match = WINDOW_RE.search(url)
+    return match.group(1) if match else None
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +399,9 @@ def process_repository(
     On success the previous row is replaced. On any failure the previous snapshot
     is kept and the error is written to the `log` table — the run never crashes.
     """
-    since = config.get("since", "daily")
+    # La fenêtre vient de l'URL en priorité : un flux ajouté via le formulaire
+    # `form` n'a pas de `config.since` (le formulaire ne renseigne que l'URL).
+    since = window_from_url(repository_url) or config.get("since") or "daily"
     try:
         repos = fetch_trending(repository_url)
         content = build_content(since, repository_url, repos, executed_at)
