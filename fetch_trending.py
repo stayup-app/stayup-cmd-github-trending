@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Stayup — scrapes GitHub's trending repositories and stores them in PostgreSQL.
+Stayup — scrapes GitHub's trending repositories and stores them via stayup-api.
 
 Three sources are tracked, one per trending window:
   https://github.com/trending?since=daily
@@ -9,8 +9,11 @@ Three sources are tracked, one per trending window:
 
 github.com/trending has no public API, so each window is a plain HTML page
 scraped on every run. Each run fully replaces the stored snapshot for every
-window, so connector_github_trending always holds exactly three rows — one
-ranked list of repositories per window, refreshed on every execution.
+window, so this provider always holds exactly one row per window, refreshed
+on every execution.
+
+Talks to stayup-api over HTTP (STAYUP_API_URL + STAYUP_API_KEY) — it never
+touches a database directly. See stayup-api/docs/self-hosting-and-providers.md.
 """
 
 from __future__ import annotations
@@ -21,66 +24,31 @@ import re
 import sys
 from datetime import datetime, timezone
 
-import psycopg2
 import requests
 from bs4 import BeautifulSoup
-
-DDL = """
-CREATE TABLE IF NOT EXISTS repository (
-    id          SERIAL PRIMARY KEY,
-    url         TEXT NOT NULL UNIQUE,
-    type        TEXT NOT NULL,
-    config      JSONB NOT NULL DEFAULT '{}',
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS connector_github_trending (
-    id          SERIAL PRIMARY KEY,
-    repository_id INTEGER NOT NULL REFERENCES repository(id),
-    version     TEXT,
-    content     TEXT NOT NULL,
-    datetime    TIMESTAMPTZ,
-    executed_at TIMESTAMPTZ NOT NULL,
-    success     BOOLEAN NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS log (
-    id          SERIAL PRIMARY KEY,
-    repository_id  INTEGER,
-    error       TEXT NOT NULL,
-    executed_at TIMESTAMPTZ NOT NULL
-);
-
--- Registre partagé des providers : chaque collecteur y déclare son nom affiché et
--- son template d'affichage au démarrage. L'API stayup-api lit cette table pour
--- construire une UI dynamique ; elle ne connaît aucun nom de provider en dur,
--- seulement les tables connector_*. Le registre est renseigné juste après ce DDL
--- (voir REGISTER_PROVIDER_SQL) — pas ici, pour passer le template en paramètre.
-CREATE TABLE IF NOT EXISTS provider_registry (
-    name          TEXT PRIMARY KEY,
-    display_name  TEXT NOT NULL,
-    sort_order    INTEGER NOT NULL DEFAULT 100,
-    template      JSONB,
-    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
--- Registre antérieur à la colonne `template` : on l'ajoute sans rien réécrire.
-ALTER TABLE provider_registry ADD COLUMN IF NOT EXISTS template JSONB;
-"""
 
 PROVIDER_TYPE = "github_trending"
 
 # Nom affiché du provider dans les apps (fallback : nom de table capitalisé).
 DISPLAY_NAME = "GitHub Trending"
 
+# Où ce connecteur se classe parmi les autres dans la barre latérale.
+SORT_ORDER = 50
+
+# Instance stayup-api à laquelle parler, et la clé qui authentifie ce
+# connecteur pour le provider 'github_trending' — obtenue depuis l'admin de
+# cette instance (voir stayup-api/docs/self-hosting-and-providers.md).
+API_URL = os.environ.get("STAYUP_API_URL", "http://localhost:3000").rstrip("/")
+API_KEY = os.environ.get("STAYUP_API_KEY")
+
 # Manifeste d'affichage : comment les 3 apps (ui / desktop / mobile) rendent les
 # lignes de ce connecteur, sans une ligne de code côté app. stayup-api le relaie
 # tel quel depuis provider_registry.template, sans jamais l'interpréter.
 # Schéma : voir stayup-api/docs/self-hosting-and-providers.md.
 #
-# Une ligne connector_github_trending = une fenêtre (daily/weekly/monthly) dont le
-# `content` JSON porte la liste `repos`. L'entrée de liste résume la fenêtre ; le
-# volet de lecture est le tableau de ses dépôts (comme github.com/trending).
+# Une entrée = une fenêtre (daily/weekly/monthly) dont le `content` JSON porte
+# la liste `repos`. L'entrée de liste résume la fenêtre ; le volet de lecture
+# est le tableau de ses dépôts (comme github.com/trending).
 DISPLAY_TEMPLATE = {
     "version": 1,
     "display": {
@@ -95,7 +63,7 @@ DISPLAY_TEMPLATE = {
             "stroke": True,
         },
         "accent": "#f4b585",
-        "sortOrder": 50,
+        "sortOrder": SORT_ORDER,
         # Libellé court du flux dans la sidebar : daily / weekly / monthly. Lu
         # depuis l'URL (et non config.since) pour rester correct même quand le
         # flux a été ajouté via le formulaire `form` ci-dessous, qui ne renseigne
@@ -175,23 +143,11 @@ DISPLAY_TEMPLATE = {
     },
 }
 
-# Upsert du registre, template passé en paramètre (le JSON contient des guillemets
-# et échapperait mal dans un DDL littéral). `sort_order` n'est pas réécrit sur
-# conflit, par cohérence avec les autres collecteurs stayup-cmd-*.
-REGISTER_PROVIDER_SQL = """
-INSERT INTO provider_registry (name, display_name, sort_order, template)
-VALUES (%s, %s, %s, %s::jsonb)
-ON CONFLICT (name) DO UPDATE SET
-    display_name = EXCLUDED.display_name,
-    template     = EXCLUDED.template,
-    updated_at   = NOW();
-"""
-
 # The three tracked trending windows. Seeded automatically on every run.
-SOURCES = [
-    ("https://github.com/trending?since=daily", {"since": "daily"}),
-    ("https://github.com/trending?since=weekly", {"since": "weekly"}),
-    ("https://github.com/trending?since=monthly", {"since": "monthly"}),
+SOURCE_URLS = [
+    "https://github.com/trending?since=daily",
+    "https://github.com/trending?since=weekly",
+    "https://github.com/trending?since=monthly",
 ]
 
 PERIOD_STARS_RE = re.compile(r"([\d,]+)\s+stars?\s+(?:today|this week|this month)")
@@ -206,100 +162,86 @@ def window_from_url(url: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Database
+# stayup-api client
 # ---------------------------------------------------------------------------
 
 
-def get_db_conn() -> psycopg2.extensions.connection:
-    """Return a psycopg2 connection.
+def api_request(method: str, path: str, **kwargs) -> dict | None:
+    """Call one of stayup-api's /connector-api/github_trending/* endpoints.
 
-    Reads DATABASE_URL first; falls back to individual DB_* environment
-    variables (DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD).
+    Raises RuntimeError if STAYUP_API_KEY isn't set, or requests.HTTPError on
+    a non-2xx response (via raise_for_status).
     """
-    database_url = os.environ.get("DATABASE_URL")
-    if database_url:
-        return psycopg2.connect(database_url)
-    return psycopg2.connect(
-        host=os.environ.get("DB_HOST", "localhost"),
-        port=int(os.environ.get("DB_PORT", 5432)),
-        dbname=os.environ["DB_NAME"],
-        user=os.environ["DB_USER"],
-        password=os.environ["DB_PASSWORD"],
+    if not API_KEY:
+        raise RuntimeError("STAYUP_API_KEY is not set.")
+    url = f"{API_URL}/connector-api/{PROVIDER_TYPE}{path}"
+    headers = {"Authorization": f"Bearer {API_KEY}"}
+    response = requests.request(method, url, headers=headers, timeout=30, **kwargs)
+    response.raise_for_status()
+    return response.json() if response.content else None
+
+
+def register_provider() -> None:
+    """Auto-déclaration au démarrage — nom affiché et manifeste d'affichage."""
+    api_request(
+        "POST",
+        "/register",
+        json={
+            "displayName": DISPLAY_NAME,
+            "sortOrder": SORT_ORDER,
+            "template": DISPLAY_TEMPLATE,
+        },
     )
 
 
-def init_db(conn: psycopg2.extensions.connection) -> None:
-    """Create tables if they don't exist and register the provider (name + display template)."""
-    with conn.cursor() as cur:
-        cur.execute(DDL)
-        cur.execute(
-            REGISTER_PROVIDER_SQL,
-            (PROVIDER_TYPE, DISPLAY_NAME, 50, json.dumps(DISPLAY_TEMPLATE)),
-        )
-    conn.commit()
+def ensure_sources() -> None:
+    """Track the three trending windows if they aren't already. Idempotent on URL."""
+    for url in SOURCE_URLS:
+        api_request("POST", "/sources", json={"url": url})
 
 
-def ensure_sources(conn: psycopg2.extensions.connection) -> None:
-    """Insert the three tracked trending windows if they are not present yet."""
-    with conn.cursor() as cur:
-        for url, config in SOURCES:
-            cur.execute(
-                """
-                INSERT INTO repository (url, type, config)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (url) DO NOTHING
-                """,
-                (url, PROVIDER_TYPE, json.dumps(config)),
-            )
-    conn.commit()
-
-
-def get_repositories(conn: psycopg2.extensions.connection) -> list[tuple[int, str, dict]]:
-    """Return tracked repositories of type 'github_trending' as (id, url, config) tuples."""
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT id, url, config FROM repository WHERE type = %s ORDER BY id",
-            (PROVIDER_TYPE,),
-        )
-        rows = cur.fetchall()
-        return [(row[0], row[1], json.loads(row[2]) if isinstance(row[2], str) else (row[2] or {})) for row in rows]
+def get_sources() -> list[tuple[int, str, dict]]:
+    """Return all tracked sources as (id, url, config) tuples."""
+    result = api_request("GET", "/sources")
+    return [(s["id"], s["url"], s.get("config") or {}) for s in result["sources"]]
 
 
 def replace_entry(
-    conn: psycopg2.extensions.connection,
-    repository_id: int,
-    version: str,
-    content: str,
-    entry_datetime: datetime,
-    executed_at: datetime,
+    repository_id: int, version: str, content: str, entry_datetime: datetime, executed_at: datetime
 ) -> None:
-    """Replace the stored snapshot for one window — keeps exactly one row per repository."""
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM connector_github_trending WHERE repository_id = %s", (repository_id,))
-        cur.execute(
-            """
-            INSERT INTO connector_github_trending
-                (repository_id, version, content, datetime, executed_at, success)
-            VALUES (%s, %s, %s, %s, %s, TRUE)
-            """,
-            (repository_id, version, content, entry_datetime, executed_at),
-        )
-    conn.commit()
+    """Replace the stored snapshot for one window — keeps exactly one entry per source.
+
+    Deletes the previous snapshot first (retentionDays=0 purges everything
+    already stored, since it's necessarily in the past), then stores the new
+    one — same order as the original DELETE-then-INSERT, to avoid any risk of
+    the fresh row being purged by a same-instant comparison.
+    """
+    api_request("DELETE", f"/sources/{repository_id}/old-items", params={"retentionDays": 0})
+    api_request(
+        "POST",
+        "/items",
+        json={
+            "items": [
+                {
+                    "repositoryId": repository_id,
+                    "version": version,
+                    "content": content,
+                    "datetime": entry_datetime.isoformat(),
+                    "executedAt": executed_at.isoformat(),
+                    "success": True,
+                }
+            ]
+        },
+    )
 
 
-def save_error(
-    conn: psycopg2.extensions.connection,
-    repository_id: int | None,
-    error: str,
-    executed_at: datetime,
-) -> None:
-    """Persist a per-source failure to the log table."""
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO log (repository_id, error, executed_at) VALUES (%s, %s, %s)",
-            (repository_id, error, executed_at),
-        )
-    conn.commit()
+def save_error(repository_id: int | None, error: str, executed_at: datetime) -> None:
+    """Persist a per-source failure."""
+    api_request(
+        "POST",
+        "/errors",
+        json={"repositoryId": repository_id, "error": error, "executedAt": executed_at.isoformat()},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -387,17 +329,11 @@ def build_content(since: str, url: str, repos: list[dict], executed_at: datetime
 # ---------------------------------------------------------------------------
 
 
-def process_repository(
-    conn: psycopg2.extensions.connection,
-    repository_id: int,
-    repository_url: str,
-    executed_at: datetime,
-    config: dict,
-) -> None:
+def process_repository(repository_id: int, repository_url: str, executed_at: datetime, config: dict) -> None:
     """Refresh the stored snapshot for one trending window.
 
-    On success the previous row is replaced. On any failure the previous snapshot
-    is kept and the error is written to the `log` table — the run never crashes.
+    On success the previous entry is replaced. On any failure the previous
+    snapshot is kept and the error is logged via the API — the run never crashes.
     """
     # La fenêtre vient de l'URL en priorité : un flux ajouté via le formulaire
     # `form` n'a pas de `config.since` (le formulaire ne renseigne que l'URL).
@@ -406,23 +342,19 @@ def process_repository(
         repos = fetch_trending(repository_url)
         content = build_content(since, repository_url, repos, executed_at)
         version = f"{since}@{executed_at:%Y-%m-%d}"
-        replace_entry(conn, repository_id, version, content, executed_at, executed_at)
+        replace_entry(repository_id, version, content, executed_at, executed_at)
     except Exception as e:
-        save_error(conn, repository_id, str(e), executed_at)
+        save_error(repository_id, str(e), executed_at)
         print(f"[{repository_url}] Error: {e}", file=sys.stderr)
 
 
 def main() -> None:
-    conn = get_db_conn()
-    try:
-        init_db(conn)
-        ensure_sources(conn)
+    register_provider()
+    ensure_sources()
 
-        executed_at = datetime.now(tz=timezone.utc)
-        for repository_id, repository_url, config in get_repositories(conn):
-            process_repository(conn, repository_id, repository_url, executed_at, config)
-    finally:
-        conn.close()
+    executed_at = datetime.now(tz=timezone.utc)
+    for repository_id, repository_url, config in get_sources():
+        process_repository(repository_id, repository_url, executed_at, config)
 
 
 if __name__ == "__main__":  # pragma: no cover

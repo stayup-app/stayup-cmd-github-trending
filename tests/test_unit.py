@@ -1,7 +1,8 @@
-"""Unit tests — no external dependencies (DB, network)."""
+"""Unit tests — no external dependencies. stayup-api itself is mocked
+(unittest.mock.patch on `requests.request`); its actual behavior is covered
+by stayup-api's own test suite. github.com/trending's HTML is mocked too."""
 
 import json
-import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,16 +12,15 @@ import pytest
 
 from fetch_trending import (
     DISPLAY_TEMPLATE,
-    SOURCES,
+    SOURCE_URLS,
     _parse_int,
     build_content,
     ensure_sources,
     fetch_trending,
-    get_db_conn,
-    get_repositories,
-    init_db,
+    get_sources,
     main,
     process_repository,
+    register_provider,
     replace_entry,
     save_error,
     window_from_url,
@@ -29,12 +29,13 @@ from fetch_trending import (
 FIXTURE_HTML = (Path(__file__).parent / "fixtures" / "trending.html").read_text(encoding="utf-8")
 
 
-def make_conn_mock():
-    conn = MagicMock()
-    cursor = MagicMock()
-    conn.cursor.return_value.__enter__ = MagicMock(return_value=cursor)
-    conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
-    return conn, cursor
+def mock_response(json_body=None, status=200):
+    response = MagicMock()
+    response.status_code = status
+    response.content = b"{}" if json_body is not None else b""
+    response.json.return_value = json_body
+    response.raise_for_status.return_value = None
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -190,36 +191,104 @@ class TestWindowFromUrl:
 
 
 # ---------------------------------------------------------------------------
-# DB helpers (mocked connection)
+# stayup-api client
 # ---------------------------------------------------------------------------
 
 
-class TestInitDb:
-    def test_runs_ddl_then_registers_provider_and_commits(self):
-        conn, cursor = make_conn_mock()
-        init_db(conn)
-        assert cursor.execute.call_count == 2
-        conn.commit.assert_called_once()
+@patch("fetch_trending.API_KEY", "test-key")
+class TestRegisterProvider:
+    @patch("fetch_trending.requests.request")
+    def test_posts_display_name_sort_order_and_template(self, mock_request):
+        mock_request.return_value = mock_response()
+        register_provider()
+        method, url = mock_request.call_args[0]
+        assert method == "POST"
+        assert url.endswith("/connector-api/github_trending/register")
+        body = mock_request.call_args.kwargs["json"]
+        assert body["displayName"] == "GitHub Trending"
+        assert body["sortOrder"] == 50
+        assert body["template"] == DISPLAY_TEMPLATE
 
-    def test_ddl_defines_table_and_adds_template_column(self):
-        conn, cursor = make_conn_mock()
-        init_db(conn)
-        ddl = cursor.execute.call_args_list[0].args[0]
-        assert "CREATE TABLE IF NOT EXISTS connector_github_trending" in ddl
-        assert "ADD COLUMN IF NOT EXISTS template" in ddl
 
-    def test_registers_provider_with_display_template_as_param(self):
-        conn, cursor = make_conn_mock()
-        init_db(conn)
-        sql, params = cursor.execute.call_args_list[1].args
-        assert "INSERT INTO provider_registry" in sql
-        assert "template" in sql
-        name, display, sort_order, template_json = params
-        assert (name, display, sort_order) == ("github_trending", "GitHub Trending", 50)
-        template = json.loads(template_json)
-        assert template["version"] == 1
-        assert template["detail"]["mode"] == "table"
-        assert template["detail"]["collection"] == "repos"
+class TestApiRequestWithoutKey:
+    @patch("fetch_trending.API_KEY", None)
+    def test_raises_when_no_api_key_is_configured(self):
+        with pytest.raises(RuntimeError, match="STAYUP_API_KEY"):
+            register_provider()
+
+
+@patch("fetch_trending.API_KEY", "test-key")
+class TestEnsureSources:
+    @patch("fetch_trending.requests.request")
+    def test_posts_the_three_windows(self, mock_request):
+        mock_request.return_value = mock_response({"id": 1, "url": "u"})
+        ensure_sources()
+        assert mock_request.call_count == 3
+        urls = {c.kwargs["json"]["url"] for c in mock_request.call_args_list}
+        assert urls == set(SOURCE_URLS)
+        for c in mock_request.call_args_list:
+            assert c.args[0] == "POST"
+            assert c.args[1].endswith("/connector-api/github_trending/sources")
+
+
+@patch("fetch_trending.API_KEY", "test-key")
+class TestGetSources:
+    @patch("fetch_trending.requests.request")
+    def test_returns_id_url_config_tuples(self, mock_request):
+        mock_request.return_value = mock_response(
+            {"sources": [{"id": 1, "url": "https://github.com/trending?since=daily", "config": {}}]}
+        )
+        assert get_sources() == [(1, "https://github.com/trending?since=daily", {})]
+
+
+@patch("fetch_trending.API_KEY", "test-key")
+class TestReplaceEntry:
+    @patch("fetch_trending.requests.request")
+    def test_deletes_everything_then_inserts(self, mock_request):
+        mock_request.return_value = mock_response({"success": True})
+        executed_at = datetime.now(tz=timezone.utc)
+        replace_entry(3, "daily@2026-08-28", "{}", executed_at, executed_at)
+
+        assert mock_request.call_count == 2
+        delete_call, insert_call = mock_request.call_args_list
+        assert delete_call.args[0] == "DELETE"
+        assert delete_call.args[1].endswith("/connector-api/github_trending/sources/3/old-items")
+        assert delete_call.kwargs["params"] == {"retentionDays": 0}
+        assert insert_call.args[0] == "POST"
+        assert insert_call.args[1].endswith("/connector-api/github_trending/items")
+
+    @patch("fetch_trending.requests.request")
+    def test_insert_item_fields(self, mock_request):
+        mock_request.return_value = mock_response({"success": True})
+        executed_at = datetime(2026, 8, 28, tzinfo=timezone.utc)
+        replace_entry(7, "weekly@2026-08-28", '{"x": 1}', executed_at, executed_at)
+
+        item = mock_request.call_args_list[1].kwargs["json"]["items"][0]
+        assert item == {
+            "repositoryId": 7,
+            "version": "weekly@2026-08-28",
+            "content": '{"x": 1}',
+            "datetime": executed_at.isoformat(),
+            "executedAt": executed_at.isoformat(),
+            "success": True,
+        }
+
+
+@patch("fetch_trending.API_KEY", "test-key")
+class TestSaveError:
+    @patch("fetch_trending.requests.request")
+    def test_posts_the_error(self, mock_request):
+        mock_request.return_value = mock_response({"success": True})
+        executed_at = datetime.now(tz=timezone.utc)
+        save_error(5, "boom", executed_at)
+        body = mock_request.call_args.kwargs["json"]
+        assert body == {"repositoryId": 5, "error": "boom", "executedAt": executed_at.isoformat()}
+
+    @patch("fetch_trending.requests.request")
+    def test_accepts_none_repository_id(self, mock_request):
+        mock_request.return_value = mock_response({"success": True})
+        save_error(None, "network error", datetime.now(tz=timezone.utc))
+        assert mock_request.call_args.kwargs["json"]["repositoryId"] is None
 
 
 class TestDisplayTemplate:
@@ -227,8 +296,6 @@ class TestDisplayTemplate:
         assert json.loads(json.dumps(DISPLAY_TEMPLATE)) == DISPLAY_TEMPLATE
 
     def test_ships_a_self_describing_icon(self):
-        # Le connecteur fournit son icône (tracé SVG teintable), pas une clé du
-        # jeu intégré des apps : un nouveau connecteur s'affiche sans toucher au code.
         icon = DISPLAY_TEMPLATE["display"]["icon"]
         assert isinstance(icon, dict)
         assert icon["paths"]
@@ -283,170 +350,66 @@ class TestDisplayTemplate:
         assert re.match(form["pattern"], "weekly")
         assert re.match(form["pattern"], "https://github.com/trending?since=weekly") is None
         # chaque mot du formulaire reconstruit exactement l'URL d'une source seedée
-        seeded = {url for url, _ in SOURCES}
         for word in ("daily", "weekly", "monthly"):
-            assert form["urlTemplate"].replace("{value}", word) in seeded
-
-
-class TestEnsureSources:
-    def test_inserts_the_three_windows(self):
-        conn, cursor = make_conn_mock()
-        ensure_sources(conn)
-        assert cursor.execute.call_count == 3
-        conn.commit.assert_called_once()
-        urls = {call.args[1][0] for call in cursor.execute.call_args_list}
-        assert urls == {
-            "https://github.com/trending?since=daily",
-            "https://github.com/trending?since=weekly",
-            "https://github.com/trending?since=monthly",
-        }
-
-    def test_insert_is_idempotent_sql(self):
-        conn, cursor = make_conn_mock()
-        ensure_sources(conn)
-        sql = cursor.execute.call_args[0][0]
-        assert "ON CONFLICT (url) DO NOTHING" in sql
-
-
-class TestGetRepositories:
-    def test_filters_on_provider_type(self):
-        conn, cursor = make_conn_mock()
-        cursor.fetchall.return_value = []
-        get_repositories(conn)
-        sql, params = cursor.execute.call_args[0]
-        assert "WHERE type = %s" in sql
-        assert params == ("github_trending",)
-
-    def test_returns_tuples_with_parsed_config(self):
-        conn, cursor = make_conn_mock()
-        cursor.fetchall.return_value = [
-            (1, "https://github.com/trending?since=daily", '{"since": "daily"}'),
-            (2, "https://github.com/trending?since=weekly", {"since": "weekly"}),
-        ]
-        result = get_repositories(conn)
-        assert result[0] == (1, "https://github.com/trending?since=daily", {"since": "daily"})
-        assert result[1] == (2, "https://github.com/trending?since=weekly", {"since": "weekly"})
-
-
-class TestReplaceEntry:
-    def test_deletes_then_inserts_and_commits(self):
-        conn, cursor = make_conn_mock()
-        executed_at = datetime.now(tz=timezone.utc)
-        replace_entry(conn, 3, "daily@2026-08-28", "{}", executed_at, executed_at)
-
-        assert cursor.execute.call_count == 2
-        delete_sql = cursor.execute.call_args_list[0].args[0]
-        insert_sql = cursor.execute.call_args_list[1].args[0]
-        assert delete_sql.strip().startswith("DELETE FROM connector_github_trending")
-        assert "INSERT INTO connector_github_trending" in insert_sql
-        assert "TRUE" in insert_sql
-        conn.commit.assert_called_once()
-
-    def test_insert_params(self):
-        conn, cursor = make_conn_mock()
-        executed_at = datetime(2026, 8, 28, tzinfo=timezone.utc)
-        replace_entry(conn, 7, "weekly@2026-08-28", '{"x": 1}', executed_at, executed_at)
-        params = cursor.execute.call_args_list[1].args[1]
-        assert params == (7, "weekly@2026-08-28", '{"x": 1}', executed_at, executed_at)
-
-
-class TestSaveError:
-    def test_inserts_into_log_and_commits(self):
-        conn, cursor = make_conn_mock()
-        executed_at = datetime.now(tz=timezone.utc)
-        save_error(conn, 5, "boom", executed_at)
-        sql, params = cursor.execute.call_args[0]
-        assert "INSERT INTO log" in sql
-        assert params == (5, "boom", executed_at)
-        conn.commit.assert_called_once()
-
-    def test_accepts_none_repository_id(self):
-        conn, cursor = make_conn_mock()
-        save_error(conn, None, "network error", datetime.now(tz=timezone.utc))
-        assert cursor.execute.call_args[0][1][0] is None
+            assert form["urlTemplate"].replace("{value}", word) in SOURCE_URLS
 
 
 # ---------------------------------------------------------------------------
-# process_repository (mocked connection + network)
+# process_repository — end to end, stayup-api and network mocked
 # ---------------------------------------------------------------------------
 
 
+@patch("fetch_trending.API_KEY", "test-key")
 class TestProcessRepository:
+    @patch("fetch_trending.save_error")
+    @patch("fetch_trending.replace_entry")
     @patch("fetch_trending.fetch_trending")
-    def test_success_replaces_entry(self, mock_fetch):
+    def test_success_replaces_entry(self, mock_fetch, mock_replace, mock_save_error):
         mock_fetch.return_value = [{"rank": 1, "full_name": "a/b"}]
-        conn, cursor = make_conn_mock()
         executed_at = datetime(2026, 8, 28, tzinfo=timezone.utc)
 
-        process_repository(conn, 1, "https://github.com/trending?since=daily", executed_at, {"since": "daily"})
+        process_repository(1, "https://github.com/trending?since=daily", executed_at, {"since": "daily"})
 
-        insert_sql = cursor.execute.call_args_list[-1].args[0]
-        assert "INSERT INTO connector_github_trending" in insert_sql
-        version = cursor.execute.call_args_list[-1].args[1][1]
-        assert version == "daily@2026-08-28"
+        mock_replace.assert_called_once()
+        assert mock_replace.call_args[0][1] == "daily@2026-08-28"
+        mock_save_error.assert_not_called()
 
+    @patch("fetch_trending.save_error")
+    @patch("fetch_trending.replace_entry")
     @patch("fetch_trending.fetch_trending")
-    def test_failure_is_logged_not_raised(self, mock_fetch):
+    def test_failure_is_logged_not_raised(self, mock_fetch, mock_replace, mock_save_error):
         mock_fetch.side_effect = RuntimeError("rate limited")
-        conn, cursor = make_conn_mock()
         executed_at = datetime.now(tz=timezone.utc)
 
-        process_repository(conn, 1, "https://github.com/trending", executed_at, {"since": "daily"})
+        process_repository(1, "https://github.com/trending", executed_at, {"since": "daily"})
 
-        sql = cursor.execute.call_args[0][0]
-        assert "INSERT INTO log" in sql
-        assert "rate limited" in cursor.execute.call_args[0][1][1]
+        mock_replace.assert_not_called()
+        mock_save_error.assert_called_once_with(1, "rate limited", executed_at)
 
+    @patch("fetch_trending.replace_entry")
     @patch("fetch_trending.fetch_trending")
-    def test_defaults_to_daily_when_since_missing(self, mock_fetch):
+    def test_defaults_to_daily_when_since_missing(self, mock_fetch, mock_replace):
         mock_fetch.return_value = [{"rank": 1, "full_name": "a/b"}]
-        conn, cursor = make_conn_mock()
         executed_at = datetime(2026, 8, 28, tzinfo=timezone.utc)
+        process_repository(1, "https://github.com/trending", executed_at, {})
+        assert mock_replace.call_args[0][1] == "daily@2026-08-28"
 
-        process_repository(conn, 1, "https://github.com/trending", executed_at, {})
-
-        assert cursor.execute.call_args_list[-1].args[1][1] == "daily@2026-08-28"
-
+    @patch("fetch_trending.replace_entry")
     @patch("fetch_trending.fetch_trending")
-    def test_derives_window_from_url_when_config_has_no_since(self, mock_fetch):
+    def test_derives_window_from_url_when_config_has_no_since(self, mock_fetch, mock_replace):
         # Cas d'un flux ajouté via le formulaire `form` : config vide, fenêtre dans l'URL.
         mock_fetch.return_value = [{"rank": 1, "full_name": "a/b"}]
-        conn, cursor = make_conn_mock()
         executed_at = datetime(2026, 8, 28, tzinfo=timezone.utc)
+        process_repository(1, "https://github.com/trending?since=weekly", executed_at, {})
+        assert mock_replace.call_args[0][1] == "weekly@2026-08-28"
 
-        process_repository(conn, 1, "https://github.com/trending?since=weekly", executed_at, {})
-
-        assert cursor.execute.call_args_list[-1].args[1][1] == "weekly@2026-08-28"
-
+    @patch("fetch_trending.replace_entry")
     @patch("fetch_trending.fetch_trending")
-    def test_falls_back_to_config_since_when_url_has_no_window(self, mock_fetch):
+    def test_falls_back_to_config_since_when_url_has_no_window(self, mock_fetch, mock_replace):
         mock_fetch.return_value = [{"rank": 1, "full_name": "a/b"}]
-        conn, cursor = make_conn_mock()
         executed_at = datetime(2026, 8, 28, tzinfo=timezone.utc)
-
-        process_repository(conn, 1, "https://github.com/trending", executed_at, {"since": "monthly"})
-
-        assert cursor.execute.call_args_list[-1].args[1][1] == "monthly@2026-08-28"
-
-
-# ---------------------------------------------------------------------------
-# get_db_conn
-# ---------------------------------------------------------------------------
-
-
-class TestGetDbConn:
-    @patch("fetch_trending.psycopg2.connect")
-    def test_uses_database_url_when_set(self, mock_connect):
-        with patch.dict(os.environ, {"DATABASE_URL": "postgresql://u:p@h:5432/db"}, clear=True):
-            get_db_conn()
-        mock_connect.assert_called_once_with("postgresql://u:p@h:5432/db")
-
-    @patch("fetch_trending.psycopg2.connect")
-    def test_falls_back_to_individual_db_vars(self, mock_connect):
-        env = {"DB_HOST": "pg", "DB_PORT": "6543", "DB_NAME": "d", "DB_USER": "u", "DB_PASSWORD": "s"}
-        with patch.dict(os.environ, env, clear=True):
-            get_db_conn()
-        mock_connect.assert_called_once_with(host="pg", port=6543, dbname="d", user="u", password="s")
+        process_repository(1, "https://github.com/trending", executed_at, {"since": "monthly"})
+        assert mock_replace.call_args[0][1] == "monthly@2026-08-28"
 
 
 # ---------------------------------------------------------------------------
@@ -456,13 +419,10 @@ class TestGetDbConn:
 
 class TestMain:
     @patch("fetch_trending.process_repository")
-    @patch("fetch_trending.get_repositories")
+    @patch("fetch_trending.get_sources")
     @patch("fetch_trending.ensure_sources")
-    @patch("fetch_trending.init_db")
-    @patch("fetch_trending.get_db_conn")
-    def test_processes_every_source_then_closes(self, mock_conn, mock_init, mock_seed, mock_get, mock_process):
-        conn = MagicMock()
-        mock_conn.return_value = conn
+    @patch("fetch_trending.register_provider")
+    def test_processes_every_source(self, mock_register, mock_seed, mock_get, mock_process):
         mock_get.return_value = [
             (1, "https://github.com/trending?since=daily", {"since": "daily"}),
             (2, "https://github.com/trending?since=weekly", {"since": "weekly"}),
@@ -470,21 +430,9 @@ class TestMain:
 
         main()
 
-        mock_init.assert_called_once_with(conn)
-        mock_seed.assert_called_once_with(conn)
+        mock_register.assert_called_once()
+        mock_seed.assert_called_once()
         assert mock_process.call_count == 2
         assert mock_process.call_args_list[0] == call(
-            conn, 1, "https://github.com/trending?since=daily", ANY, {"since": "daily"}
+            1, "https://github.com/trending?since=daily", ANY, {"since": "daily"}
         )
-        conn.close.assert_called_once()
-
-    @patch("fetch_trending.init_db", side_effect=RuntimeError("db down"))
-    @patch("fetch_trending.get_db_conn")
-    def test_closes_connection_even_on_error(self, mock_conn, _mock_init):
-        conn = MagicMock()
-        mock_conn.return_value = conn
-
-        with pytest.raises(RuntimeError, match="db down"):
-            main()
-
-        conn.close.assert_called_once()
