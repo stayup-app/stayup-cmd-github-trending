@@ -6,85 +6,54 @@
 **Website:** https://stayup-ui.vercel.app
 
 Scrapes [github.com/trending](https://github.com/trending) and stores the ranked list of
-repositories in PostgreSQL, one row per time window.
+repositories via [stayup-api](https://github.com/stayup-app/stayup-api) — this script never touches
+a database directly, it only calls `stayup-api`'s `/connector-api/github_trending/*` endpoints — one
+entry per time window.
 
 ## How it works
 
 `github.com/trending` has no public API, so each window is a plain HTML page scraped on every run.
 Three sources are tracked and seeded automatically on startup:
 
-| `repository.url`                                | `repository.config`   |
-|------------------------------------------------|-----------------------|
-| `https://github.com/trending?since=daily`       | `{"since": "daily"}`   |
-| `https://github.com/trending?since=weekly`      | `{"since": "weekly"}`  |
-| `https://github.com/trending?since=monthly`     | `{"since": "monthly"}` |
+- `https://github.com/trending?since=daily`
+- `https://github.com/trending?since=weekly`
+- `https://github.com/trending?since=monthly`
 
 On each run, for every window:
 
 1. Fetch the trending page and parse each `article.Box-row` (rank, owner, name, URL, description,
    language, total stars, total forks, stars gained in the window).
-2. **Replace** the stored snapshot for that window: the previous `connector_github_trending` row is
-   deleted and a fresh one inserted.
+2. **Replace** the stored snapshot for that window: the previous entry is deleted
+   (`DELETE .../old-items?retentionDays=0`, which purges everything already stored) and a fresh one
+   inserted.
 
-So `connector_github_trending` always holds **exactly three rows** — one per window — each refreshed
-on every execution. If a window fails to fetch, its previous snapshot is kept and the error is
-written to the `log` table; the run never crashes.
+So this provider always holds **exactly one entry per window** — three total — each refreshed on
+every execution. If a window fails to fetch, its previous snapshot is kept and the error is logged
+via the API; the run never crashes.
 
 The window a source tracks is read from its `repository.url` (`?since=…`); `config.since` is only a
 fallback. So a source added through the app — where the display template's `form` block (see below)
 asks for a single word, **`daily` / `weekly` / `monthly`**, instead of the full URL — works even
 though the app stores no `config`.
 
-> Unlike the other `stayup-cmd-*` collectors, this one keeps no history and ignores
-> `config.retention_days`: a trending list is a full snapshot that is entirely replaced each day.
-
-## Database schema
-
-```
-repository                       -- shared, seeded by this collector (type = 'github_trending')
-  id          SERIAL PK
-  url         TEXT UNIQUE
-  type        TEXT               -- 'github_trending'
-  config      JSONB              -- {"since": "daily" | "weekly" | "monthly"}
-
-connector_github_trending
-  id            SERIAL PK
-  repository_id → repository.id  -- exactly one row per source
-  version       TEXT             -- e.g. "daily@2026-08-28"
-  content       TEXT             -- JSON snapshot (see below)
-  datetime      TIMESTAMPTZ      -- snapshot time (= executed_at)
-  executed_at   TIMESTAMPTZ
-  success       BOOLEAN
-
-log
-  id            SERIAL PK
-  repository_id → repository.id
-  error         TEXT
-  executed_at   TIMESTAMPTZ
-
-provider_registry               -- shared; this collector upserts exactly its own row
-  name          TEXT PK          -- 'github_trending'
-  display_name  TEXT             -- 'GitHub Trending'
-  sort_order    INTEGER
-  template      JSONB            -- display manifest (see below)
-```
+> Unlike the other `stayup-cmd-*` collectors, this one keeps no history: a trending list is a full
+> snapshot that is entirely replaced each day.
 
 ### Display template
 
-On every run this collector upserts a **display template** into `provider_registry.template`
-(`DISPLAY_TEMPLATE` in `fetch_trending.py`). `stayup-api` relays it verbatim on
-`GET /connectors/providers`, and the 3 client apps (`stayup-ui`, `stayup-desktop`,
+On every run this collector registers a **display template** (`DISPLAY_TEMPLATE` in
+`fetch_trending.py`) via `POST /connector-api/github_trending/register`. `stayup-api` relays it
+verbatim on `GET /connectors/providers`, and the 3 client apps (`stayup-ui`, `stayup-desktop`,
 `stayup-mobile`) render this connector's feed straight from it — **no per-connector code
-in any app**. One `connector_github_trending` row is one trending window, so the feed
-entry summarises the window (`GitHub Trending — today · N repositories`) and the reading
-pane is a `mode: table` view over the embedded `repos` list, mirroring
-[github.com/trending](https://github.com/trending): rank · `owner/name` (linked) ·
-description · language · stars · forks · stars this period.
+in any app**. One entry is one trending window, so the feed entry summarises the window
+(`GitHub Trending — today · N repositories`) and the reading pane is a `mode: table` view over the
+embedded `repos` list, mirroring [github.com/trending](https://github.com/trending): rank ·
+`owner/name` (linked) · description · language · stars · forks · stars this period.
 
 The template also carries a `form` block, so the app's "add a flux" dialog shows a **single field**
 for this provider: type `daily`, `weekly` or `monthly` (or paste a full `…/trending?since=…` URL) and
-the app builds the `repository.url` itself. The feed's sidebar label (`feedLabel`) is derived from
-that URL, so it reads `daily` / `weekly` / `monthly` whether the source was seeded or added in-app.
+the app builds the source URL itself. The feed's sidebar label (`feedLabel`) is derived from that
+URL, so it reads `daily` / `weekly` / `monthly` whether the source was seeded or added in-app.
 
 The template shape is documented in
 [`stayup-api/docs/display-templates.md`](https://github.com/stayup-app/stayup-api/blob/main/docs/display-templates.md).
@@ -114,15 +83,20 @@ The template shape is documented in
 }
 ```
 
+## Requirements
+
+- Python 3.13, or [Docker](https://www.docker.com/)
+- A `stayup-api` instance (the public one, or your own — see [self-hosting-and-providers.md](https://github.com/stayup-app/stayup-api/blob/main/docs/self-hosting-and-providers.md))
+- An API key for the `github_trending` provider, created from that instance's admin panel (Connector keys → New key, provider `github_trending`). The key is shown once — copy it right away.
+
 ## Setup
 
 ### With Docker (recommended)
 
 ```bash
 cp .env.example .env
-# Fill in DB_NAME, DB_USER, DB_PASSWORD
+# Fill in STAYUP_API_URL and STAYUP_API_KEY
 
-docker compose up db -d
 docker compose run --rm fetch_trending
 ```
 
@@ -130,31 +104,29 @@ docker compose run --rm fetch_trending
 
 ```bash
 pip install -r requirements.txt
-export DATABASE_URL=postgresql://user:password@host:5432/dbname
-python fetch_trending.py
+STAYUP_API_URL=... STAYUP_API_KEY=... python fetch_trending.py
 ```
 
-Tables are created automatically on the first run.
+> **Note:** the provider registers itself and seeds its three windows automatically on every run —
+> nothing to create by hand beyond the key.
 
 ## Automation
 
 `.github/workflows/daily.yml` runs every day at **00:00 UTC** (also triggerable manually from
 **Actions → Daily GitHub Trending → Run workflow**).
 
-Required secret:
-
-- `DATABASE_URL` — connection string to your production database.
-
-Configure it in **Settings → Secrets and variables → Actions → New repository secret**, or:
+Required secrets — `STAYUP_API_URL` and `STAYUP_API_KEY` — configured in
+**Settings → Secrets and variables → Actions → New repository secret**, or:
 
 ```bash
-gh secret set DATABASE_URL -R stayup-app/stayup-cmd-github-trending
+gh secret set STAYUP_API_URL -R stayup-app/stayup-cmd-github-trending
+gh secret set STAYUP_API_KEY -R stayup-app/stayup-cmd-github-trending
 ```
 
 `.github/workflows/ci.yml` runs on every push and pull request to `main`: **ruff** + **black**
-lint, then the unit and functional test suite against a temporary PostgreSQL service. The build
-fails if line coverage of `fetch_trending.py` drops below **100%** (`--cov-fail-under=100`, set in
-`pyproject.toml`); the unit tests alone reach 100%, the functional tests add real-database checks.
+lint, then the test suite. The build fails if line coverage of `fetch_trending.py` drops below
+**100%** (`--cov-fail-under=100`, set in `pyproject.toml`) — `stayup-api` and network calls are
+mocked, so the tests need neither a database nor real network access.
 
 ## Development
 
@@ -167,11 +139,9 @@ docker compose run --rm --entrypoint="" test sh -c "ruff check . && black --chec
 docker compose run --rm test
 ```
 
-Run the suite directly (needs a PostgreSQL for the functional tests; the unit tests need neither
-a database nor network and already give 100% coverage):
+Run the suite directly:
 
 ```bash
 pip install -r requirements-dev.txt
-pytest tests/ -v                 # coverage report + 100% gate come from pyproject.toml
-pytest tests/test_unit.py -v     # unit only, no PostgreSQL required
+pytest tests/ -v     # coverage report + 100% gate come from pyproject.toml
 ```
