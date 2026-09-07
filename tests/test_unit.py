@@ -335,8 +335,8 @@ class TestDisplayTemplate:
         assert tokens <= produced | content_keys
 
     def test_feed_label_maps_each_window_url_to_its_word(self):
-        # Le libellé du flux se lit sur l'URL (pas config.since) pour rester juste
-        # même quand le flux a été ajouté via `form`, qui ne pose que l'URL.
+        # The flux label is read from the URL (not config.since) so it stays
+        # right even when the flux was added via `form`, which only sets the URL.
         cases = DISPLAY_TEMPLATE["display"]["feedLabel"]["cases"]
         assert cases == {
             "https://github.com/trending?since=daily": "daily",
@@ -349,7 +349,7 @@ class TestDisplayTemplate:
         assert form["urlTemplate"] == "https://github.com/trending?since={value}"
         assert re.match(form["pattern"], "weekly")
         assert re.match(form["pattern"], "https://github.com/trending?since=weekly") is None
-        # chaque mot du formulaire reconstruit exactement l'URL d'une source seedée
+        # each form word rebuilds exactly the URL of a seeded source
         for word in ("daily", "weekly", "monthly"):
             assert form["urlTemplate"].replace("{value}", word) in SOURCE_URLS
 
@@ -397,7 +397,7 @@ class TestProcessRepository:
     @patch("fetch_trending.replace_entry")
     @patch("fetch_trending.fetch_trending")
     def test_derives_window_from_url_when_config_has_no_since(self, mock_fetch, mock_replace):
-        # Cas d'un flux ajouté via le formulaire `form` : config vide, fenêtre dans l'URL.
+        # Case of a flux added via the `form`: empty config, window in the URL.
         mock_fetch.return_value = [{"rank": 1, "full_name": "a/b"}]
         executed_at = datetime(2026, 8, 28, tzinfo=timezone.utc)
         process_repository(1, "https://github.com/trending?since=weekly", executed_at, {})

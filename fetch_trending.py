@@ -29,31 +29,31 @@ from bs4 import BeautifulSoup
 
 PROVIDER_TYPE = "github_trending"
 
-# Nom affiché du provider dans les apps (fallback : nom de table capitalisé).
+# Display name of the provider in the apps (fallback: capitalized table name).
 DISPLAY_NAME = "GitHub Trending"
 
-# Où ce connecteur se classe parmi les autres dans la barre latérale.
+# Where this connector ranks among the others in the sidebar.
 SORT_ORDER = 50
 
-# Instance stayup-api à laquelle parler, et la clé qui authentifie ce
-# connecteur pour le provider 'github_trending' — obtenue depuis l'admin de
-# cette instance (voir stayup-api/docs/self-hosting-and-providers.md).
+# The stayup-api instance to talk to, and the key that authenticates this
+# connector for the 'github_trending' provider — obtained from that instance's
+# admin (see stayup-api/docs/self-hosting-and-providers.md).
 API_URL = os.environ.get("STAYUP_API_URL", "http://localhost:3000").rstrip("/")
 API_KEY = os.environ.get("STAYUP_API_KEY")
 
-# Manifeste d'affichage : comment les 3 apps (ui / desktop / mobile) rendent les
-# lignes de ce connecteur, sans une ligne de code côté app. stayup-api le relaie
-# tel quel depuis provider_registry.template, sans jamais l'interpréter.
-# Schéma : voir stayup-api/docs/self-hosting-and-providers.md.
+# Display manifest: how the 3 apps (ui / desktop / mobile) render this
+# connector's rows, without a line of code on the app side. stayup-api relays it
+# as-is from provider_registry.template, without ever interpreting it.
+# Schema: see stayup-api/docs/self-hosting-and-providers.md.
 #
-# Une entrée = une fenêtre (daily/weekly/monthly) dont le `content` JSON porte
-# la liste `repos`. L'entrée de liste résume la fenêtre ; le volet de lecture
-# est le tableau de ses dépôts (comme github.com/trending).
+# One entry = a window (daily/weekly/monthly) whose JSON `content` carries the
+# `repos` list. The list entry summarizes the window; the reading pane is the
+# table of its repos (like github.com/trending).
 DISPLAY_TEMPLATE = {
     "version": 1,
     "display": {
         "name": DISPLAY_NAME,
-        # Icône auto-descriptive (tracé SVG teintable). Flèche « tendance ».
+        # Self-describing icon (tintable SVG path). A "trending" arrow.
         "icon": {
             "paths": [
                 "M22 7 13.5 15.5 8.5 10.5 2 17",
@@ -64,10 +64,9 @@ DISPLAY_TEMPLATE = {
         },
         "accent": "#f4b585",
         "sortOrder": SORT_ORDER,
-        # Libellé court du flux dans la sidebar : daily / weekly / monthly. Lu
-        # depuis l'URL (et non config.since) pour rester correct même quand le
-        # flux a été ajouté via le formulaire `form` ci-dessous, qui ne renseigne
-        # que `repository.url`.
+        # The flux's short label in the sidebar: daily / weekly / monthly. Read
+        # from the URL (not config.since) so it stays correct even when the flux
+        # was added via the `form` below, which only sets `repository.url`.
         "feedLabel": {
             "path": "$source.url",
             "cases": {
@@ -128,17 +127,16 @@ DISPLAY_TEMPLATE = {
         "openUrl": "url",
         "openLabel": "Open on github.com/trending",
     },
-    # Champ « ajouter un flux » : une seule saisie (daily / weekly / monthly) au
-    # lieu de l'URL complète. stayup-ui construit lui-même `repository.url` à
-    # partir de `urlTemplate` — l'URL produite est identique à celle des 3 sources
-    # seedées (voir SOURCES), donc un ajout manuel se déduplique avec la source
-    # existante au lieu d'en créer une quatrième.
+    # "Add a flux" field: a single input (daily / weekly / monthly) instead of
+    # the full URL. stayup-ui builds `repository.url` itself from `urlTemplate` —
+    # the produced URL is identical to the 3 seeded sources' (see SOURCES), so a
+    # manual add dedupes with the existing source instead of creating a fourth.
     "form": {
         "label": "Trending window (daily, weekly or monthly)",
         "placeholder": "daily",
         "urlTemplate": "https://github.com/trending?since={value}",
         "pattern": "^(daily|weekly|monthly)$",
-        # Tolère le collage d'une URL complète : on en extrait la fenêtre.
+        # Tolerates pasting a full URL: we extract the window from it.
         "transform": {"trim": True, "extract": r"[?&]since=([a-z]+)"},
     },
 }
@@ -182,7 +180,7 @@ def api_request(method: str, path: str, **kwargs) -> dict | None:
 
 
 def register_provider() -> None:
-    """Auto-déclaration au démarrage — nom affiché et manifeste d'affichage."""
+    """Self-declaration at startup — display name and display manifest."""
     api_request(
         "POST",
         "/register",
@@ -335,8 +333,8 @@ def process_repository(repository_id: int, repository_url: str, executed_at: dat
     On success the previous entry is replaced. On any failure the previous
     snapshot is kept and the error is logged via the API — the run never crashes.
     """
-    # La fenêtre vient de l'URL en priorité : un flux ajouté via le formulaire
-    # `form` n'a pas de `config.since` (le formulaire ne renseigne que l'URL).
+    # The window comes from the URL first: a flux added via the `form` has no
+    # `config.since` (the form only sets the URL).
     since = window_from_url(repository_url) or config.get("since") or "daily"
     try:
         repos = fetch_trending(repository_url)
