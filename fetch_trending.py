@@ -41,106 +41,6 @@ SORT_ORDER = 50
 API_URL = os.environ.get("STAYUP_API_URL", "http://localhost:3000").rstrip("/")
 API_KEY = os.environ.get("STAYUP_API_KEY")
 
-# Display manifest: how the 3 apps (ui / desktop / mobile) render this
-# connector's rows, without a line of code on the app side. stayup-api relays it
-# as-is from provider_registry.template, without ever interpreting it.
-# Schema: see stayup-api/docs/self-hosting-and-providers.md.
-#
-# One entry = a window (daily/weekly/monthly) whose JSON `content` carries the
-# `repos` list. The list entry summarizes the window; the reading pane is the
-# table of its repos (like github.com/trending).
-DISPLAY_TEMPLATE = {
-    "version": 1,
-    "display": {
-        "name": DISPLAY_NAME,
-        # Self-describing icon (tintable SVG path). A "trending" arrow.
-        "icon": {
-            "paths": [
-                "M22 7 13.5 15.5 8.5 10.5 2 17",
-                "M16 7h6v6",
-            ],
-            "viewBox": "0 0 24 24",
-            "stroke": True,
-        },
-        "accent": "#f4b585",
-        "sortOrder": SORT_ORDER,
-        # The flux's short label in the sidebar: daily / weekly / monthly. Read
-        # from the URL (not config.since) so it stays correct even when the flux
-        # was added via the `form` below, which only sets `repository.url`.
-        "feedLabel": {
-            "path": "$source.url",
-            "cases": {
-                "https://github.com/trending?since=daily": "daily",
-                "https://github.com/trending?since=weekly": "weekly",
-                "https://github.com/trending?since=monthly": "monthly",
-            },
-        },
-    },
-    "item": {
-        "parseContentAsJson": True,
-        "vars": {
-            "window": {
-                "path": "since",
-                "cases": {"daily": "today", "weekly": "this week", "monthly": "this month"},
-            }
-        },
-        "fields": {
-            "title": "GitHub Trending — {window}",
-            "subtitle": "{count} repositories",
-            "summary": "The {count} repositories trending {window} on GitHub.",
-            "url": "url",
-            "timestamp": "fetched_at",
-        },
-    },
-    "list": {
-        "layout": "row",
-        "primary": "title",
-        "secondary": "subtitle",
-        "meta": "timestamp",
-    },
-    "detail": {
-        "mode": "table",
-        "title": "Trending {window}",
-        "collection": "repos",
-        "rowLink": "url",
-        "columns": [
-            {"label": "#", "field": "rank", "align": "right", "width": "2.5rem"},
-            {
-                "label": "Repository",
-                "field": "{owner}/{name}",
-                "link": "url",
-                "emphasis": True,
-            },
-            {"label": "Description", "field": "description", "muted": True, "truncate": True},
-            {"label": "Language", "field": "language"},
-            {"label": "Stars", "field": "stars", "align": "right", "format": "compactNumber"},
-            {"label": "Forks", "field": "forks", "align": "right", "format": "compactNumber"},
-            {
-                "label": "This period",
-                "field": "stars_period",
-                "align": "right",
-                "format": "compactNumber",
-                "prefix": "+",
-                "accent": True,
-            },
-        ],
-        "openUrl": "url",
-        "openLabel": "Open on github.com/trending",
-    },
-    # "Add a flux" field: a single input (daily / weekly / monthly) instead of
-    # the full URL. stayup-ui builds `repository.url` itself from `urlTemplate` —
-    # the produced URL is identical to the 3 seeded sources' (see SOURCES), so a
-    # manual add dedupes with the existing source instead of creating a fourth.
-    "form": {
-        "label": "Trending window (daily, weekly or monthly)",
-        "placeholder": "daily",
-        "urlTemplate": "https://github.com/trending?since={value}",
-        "pattern": "^(daily|weekly|monthly)$",
-        # Tolerates pasting a full URL: we extract the window from it.
-        "transform": {"trim": True, "extract": r"[?&]since=([a-z]+)"},
-    },
-}
-
 # The three tracked trending windows. Seeded automatically on every run.
 SOURCE_URLS = [
     "https://github.com/trending?since=daily",
@@ -180,14 +80,13 @@ def api_request(method: str, path: str, **kwargs) -> dict | None:
 
 
 def register_provider() -> None:
-    """Self-declaration at startup — display name and display manifest."""
+    """Self-declaration at startup — display name and sort order."""
     api_request(
         "POST",
         "/register",
         json={
             "displayName": DISPLAY_NAME,
             "sortOrder": SORT_ORDER,
-            "template": DISPLAY_TEMPLATE,
         },
     )
 

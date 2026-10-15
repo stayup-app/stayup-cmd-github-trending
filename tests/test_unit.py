@@ -3,7 +3,6 @@
 by stayup-api's own test suite. github.com/trending's HTML is mocked too."""
 
 import json
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import ANY, MagicMock, call, patch
@@ -11,7 +10,6 @@ from unittest.mock import ANY, MagicMock, call, patch
 import pytest
 
 from fetch_trending import (
-    DISPLAY_TEMPLATE,
     SOURCE_URLS,
     _parse_int,
     build_content,
@@ -198,7 +196,7 @@ class TestWindowFromUrl:
 @patch("fetch_trending.API_KEY", "test-key")
 class TestRegisterProvider:
     @patch("fetch_trending.requests.request")
-    def test_posts_display_name_sort_order_and_template(self, mock_request):
+    def test_posts_display_name_and_sort_order(self, mock_request):
         mock_request.return_value = mock_response()
         register_provider()
         method, url = mock_request.call_args[0]
@@ -207,7 +205,6 @@ class TestRegisterProvider:
         body = mock_request.call_args.kwargs["json"]
         assert body["displayName"] == "GitHub Trending"
         assert body["sortOrder"] == 50
-        assert body["template"] == DISPLAY_TEMPLATE
 
 
 class TestApiRequestWithoutKey:
@@ -289,69 +286,6 @@ class TestSaveError:
         mock_request.return_value = mock_response({"success": True})
         save_error(None, "network error", datetime.now(tz=timezone.utc))
         assert mock_request.call_args.kwargs["json"]["repositoryId"] is None
-
-
-class TestDisplayTemplate:
-    def test_round_trips_through_json_unchanged(self):
-        assert json.loads(json.dumps(DISPLAY_TEMPLATE)) == DISPLAY_TEMPLATE
-
-    def test_ships_a_self_describing_icon(self):
-        icon = DISPLAY_TEMPLATE["display"]["icon"]
-        assert isinstance(icon, dict)
-        assert icon["paths"]
-        assert all(p[:1] in ("M", "m") for p in icon["paths"])
-        assert icon["viewBox"] == "0 0 24 24"
-
-    def test_declares_a_table_detail_over_the_repos_list(self):
-        assert DISPLAY_TEMPLATE["version"] == 1
-        assert DISPLAY_TEMPLATE["display"]["name"] == "GitHub Trending"
-        assert DISPLAY_TEMPLATE["item"]["parseContentAsJson"] is True
-        detail = DISPLAY_TEMPLATE["detail"]
-        assert detail["mode"] == "table"
-        assert detail["collection"] == "repos"
-        labels = [c["label"] for c in detail["columns"]]
-        assert labels == ["#", "Repository", "Description", "Language", "Stars", "Forks", "This period"]
-        assert all("field" in c for c in detail["columns"])
-
-    def test_every_interpolation_token_is_produced_by_the_connector(self):
-        # Tokens used in {template} strings must resolve against the stored content
-        # (see build_content) or the `vars` aliases — never a field the app can't fill.
-        # `form` is excluded: its {value} is the user's form input, filled by stayup-ui.
-        produced = {"since", "url", "count", "fetched_at", "repos", "window"}
-        content_keys = {
-            "rank",
-            "owner",
-            "name",
-            "full_name",
-            "url",
-            "description",
-            "language",
-            "stars",
-            "forks",
-            "stars_period",
-        }
-        blob = json.dumps({k: v for k, v in DISPLAY_TEMPLATE.items() if k != "form"})
-        tokens = set(re.findall(r"\{(\w+)\}", blob))
-        assert tokens <= produced | content_keys
-
-    def test_feed_label_maps_each_window_url_to_its_word(self):
-        # The flux label is read from the URL (not config.since) so it stays
-        # right even when the flux was added via `form`, which only sets the URL.
-        cases = DISPLAY_TEMPLATE["display"]["feedLabel"]["cases"]
-        assert cases == {
-            "https://github.com/trending?since=daily": "daily",
-            "https://github.com/trending?since=weekly": "weekly",
-            "https://github.com/trending?since=monthly": "monthly",
-        }
-
-    def test_add_flux_form_takes_a_single_window_word(self):
-        form = DISPLAY_TEMPLATE["form"]
-        assert form["urlTemplate"] == "https://github.com/trending?since={value}"
-        assert re.match(form["pattern"], "weekly")
-        assert re.match(form["pattern"], "https://github.com/trending?since=weekly") is None
-        # each form word rebuilds exactly the URL of a seeded source
-        for word in ("daily", "weekly", "monthly"):
-            assert form["urlTemplate"].replace("{value}", word) in SOURCE_URLS
 
 
 # ---------------------------------------------------------------------------

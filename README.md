@@ -32,61 +32,17 @@ every execution. If a window fails to fetch, its previous snapshot is kept and t
 via the API; the run never crashes.
 
 The window a source tracks is read from its `repository.url` (`?since=…`); `config.since` is only a
-fallback. So a source added through the app — where the display template's `form` block (see below)
-asks for a single word, **`daily` / `weekly` / `monthly`**, instead of the full URL — works even
+fallback. So a source added through the app works even
 though the app stores no `config`.
 
 > Unlike the other `stayup-cmd-*` collectors, this one keeps no history: a trending list is a full
 > snapshot that is entirely replaced each day.
 
-### Display template
-
-On every run this collector registers a **display template** (`DISPLAY_TEMPLATE` in
-`fetch_trending.py`) via `POST /connector-api/github_trending/register`. `stayup-api` relays it
-verbatim on `GET /connectors/providers`, and the 3 client apps (`stayup-ui`, `stayup-desktop`,
-`stayup-mobile`) render this connector's feed straight from it — **no per-connector code
-in any app**. One entry is one trending window, so the feed entry summarises the window
-(`GitHub Trending — today · N repositories`) and the reading pane is a `mode: table` view over the
-embedded `repos` list, mirroring [github.com/trending](https://github.com/trending): rank ·
-`owner/name` (linked) · description · language · stars · forks · stars this period.
-
-The template also carries a `form` block, so the app's "add a flux" dialog shows a **single field**
-for this provider: type `daily`, `weekly` or `monthly` (or paste a full `…/trending?since=…` URL) and
-the app builds the source URL itself. The feed's sidebar label (`feedLabel`) is derived from that
-URL, so it reads `daily` / `weekly` / `monthly` whether the source was seeded or added in-app.
-
-The template shape is documented in
-[`stayup-api/docs/display-templates.md`](https://github.com/stayup-app/stayup-api/blob/main/docs/display-templates.md).
-
-### `content` JSON format
-
-```json
-{
-  "since": "daily",
-  "url": "https://github.com/trending?since=daily",
-  "count": 25,
-  "fetched_at": "2026-08-28T00:00:03+00:00",
-  "repos": [
-    {
-      "rank": 1,
-      "owner": "octocat",
-      "name": "hello-world",
-      "full_name": "octocat/hello-world",
-      "url": "https://github.com/octocat/hello-world",
-      "description": "My first repository on GitHub!",
-      "language": "Python",
-      "stars": 12345,
-      "forks": 678,
-      "stars_period": 456
-    }
-  ]
-}
-```
 
 ## Requirements
 
 - Python 3.13, or [Docker](https://www.docker.com/)
-- A `stayup-api` instance (the public one, or your own — see [self-hosting-and-providers.md](https://github.com/stayup-app/stayup-api/blob/main/docs/self-hosting-and-providers.md))
+- A `stayup-api` instance (see [stayup-api](https://github.com/stayup-app/stayup-api))
 - An API key for the `github_trending` provider, created from that instance's admin panel (Connector keys → New key, provider `github_trending`). The key is shown once — copy it right away.
 
 ## Setup
