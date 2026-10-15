@@ -3,7 +3,7 @@
 by stayup-api's own test suite. github.com/trending's HTML is mocked too."""
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import ANY, MagicMock, call, patch
 
@@ -152,7 +152,7 @@ class TestFetchTrending:
 
 class TestBuildContent:
     def test_shape(self):
-        executed_at = datetime(2026, 8, 28, tzinfo=timezone.utc)
+        executed_at = datetime(2026, 8, 28, tzinfo=UTC)
         repos = [{"rank": 1, "full_name": "a/b"}, {"rank": 2, "full_name": "c/d"}]
 
         payload = json.loads(build_content("daily", "https://github.com/trending", repos, executed_at))
@@ -165,7 +165,7 @@ class TestBuildContent:
 
     def test_keeps_unicode_readable(self):
         repos = [{"rank": 1, "description": "café ☕"}]
-        raw = build_content("daily", "u", repos, datetime(2026, 1, 1, tzinfo=timezone.utc))
+        raw = build_content("daily", "u", repos, datetime(2026, 1, 1, tzinfo=UTC))
         assert "café ☕" in raw
 
 
@@ -243,7 +243,7 @@ class TestReplaceEntry:
     @patch("fetch_trending.requests.request")
     def test_deletes_everything_then_inserts(self, mock_request):
         mock_request.return_value = mock_response({"success": True})
-        executed_at = datetime.now(tz=timezone.utc)
+        executed_at = datetime.now(tz=UTC)
         replace_entry(3, "daily@2026-08-28", "{}", executed_at, executed_at)
 
         assert mock_request.call_count == 2
@@ -257,7 +257,7 @@ class TestReplaceEntry:
     @patch("fetch_trending.requests.request")
     def test_insert_item_fields(self, mock_request):
         mock_request.return_value = mock_response({"success": True})
-        executed_at = datetime(2026, 8, 28, tzinfo=timezone.utc)
+        executed_at = datetime(2026, 8, 28, tzinfo=UTC)
         replace_entry(7, "weekly@2026-08-28", '{"x": 1}', executed_at, executed_at)
 
         item = mock_request.call_args_list[1].kwargs["json"]["items"][0]
@@ -276,7 +276,7 @@ class TestSaveError:
     @patch("fetch_trending.requests.request")
     def test_posts_the_error(self, mock_request):
         mock_request.return_value = mock_response({"success": True})
-        executed_at = datetime.now(tz=timezone.utc)
+        executed_at = datetime.now(tz=UTC)
         save_error(5, "boom", executed_at)
         body = mock_request.call_args.kwargs["json"]
         assert body == {"repositoryId": 5, "error": "boom", "executedAt": executed_at.isoformat()}
@@ -284,7 +284,7 @@ class TestSaveError:
     @patch("fetch_trending.requests.request")
     def test_accepts_none_repository_id(self, mock_request):
         mock_request.return_value = mock_response({"success": True})
-        save_error(None, "network error", datetime.now(tz=timezone.utc))
+        save_error(None, "network error", datetime.now(tz=UTC))
         assert mock_request.call_args.kwargs["json"]["repositoryId"] is None
 
 
@@ -300,7 +300,7 @@ class TestProcessRepository:
     @patch("fetch_trending.fetch_trending")
     def test_success_replaces_entry(self, mock_fetch, mock_replace, mock_save_error):
         mock_fetch.return_value = [{"rank": 1, "full_name": "a/b"}]
-        executed_at = datetime(2026, 8, 28, tzinfo=timezone.utc)
+        executed_at = datetime(2026, 8, 28, tzinfo=UTC)
 
         process_repository(1, "https://github.com/trending?since=daily", executed_at, {"since": "daily"})
 
@@ -313,7 +313,7 @@ class TestProcessRepository:
     @patch("fetch_trending.fetch_trending")
     def test_failure_is_logged_not_raised(self, mock_fetch, mock_replace, mock_save_error):
         mock_fetch.side_effect = RuntimeError("rate limited")
-        executed_at = datetime.now(tz=timezone.utc)
+        executed_at = datetime.now(tz=UTC)
 
         process_repository(1, "https://github.com/trending", executed_at, {"since": "daily"})
 
@@ -324,7 +324,7 @@ class TestProcessRepository:
     @patch("fetch_trending.fetch_trending")
     def test_defaults_to_daily_when_since_missing(self, mock_fetch, mock_replace):
         mock_fetch.return_value = [{"rank": 1, "full_name": "a/b"}]
-        executed_at = datetime(2026, 8, 28, tzinfo=timezone.utc)
+        executed_at = datetime(2026, 8, 28, tzinfo=UTC)
         process_repository(1, "https://github.com/trending", executed_at, {})
         assert mock_replace.call_args[0][1] == "daily@2026-08-28"
 
@@ -333,7 +333,7 @@ class TestProcessRepository:
     def test_derives_window_from_url_when_config_has_no_since(self, mock_fetch, mock_replace):
         # Case of a flux added via the `form`: empty config, window in the URL.
         mock_fetch.return_value = [{"rank": 1, "full_name": "a/b"}]
-        executed_at = datetime(2026, 8, 28, tzinfo=timezone.utc)
+        executed_at = datetime(2026, 8, 28, tzinfo=UTC)
         process_repository(1, "https://github.com/trending?since=weekly", executed_at, {})
         assert mock_replace.call_args[0][1] == "weekly@2026-08-28"
 
@@ -341,7 +341,7 @@ class TestProcessRepository:
     @patch("fetch_trending.fetch_trending")
     def test_falls_back_to_config_since_when_url_has_no_window(self, mock_fetch, mock_replace):
         mock_fetch.return_value = [{"rank": 1, "full_name": "a/b"}]
-        executed_at = datetime(2026, 8, 28, tzinfo=timezone.utc)
+        executed_at = datetime(2026, 8, 28, tzinfo=UTC)
         process_repository(1, "https://github.com/trending", executed_at, {"since": "monthly"})
         assert mock_replace.call_args[0][1] == "monthly@2026-08-28"
 

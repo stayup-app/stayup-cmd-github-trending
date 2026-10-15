@@ -22,7 +22,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import requests
 from bs4 import BeautifulSoup
@@ -249,7 +249,7 @@ def main() -> None:
     register_provider()
     ensure_sources()
 
-    executed_at = datetime.now(tz=timezone.utc)
+    executed_at = datetime.now(tz=UTC)
     for repository_id, repository_url, config in get_sources():
         process_repository(repository_id, repository_url, executed_at, config)
 
